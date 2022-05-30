@@ -270,10 +270,11 @@ func (rf *Raft) isLogUTD(index int, term int) bool {
 func (rf *Raft) AppendEntries(request *AppendEntriesArgs, reply *AppendEntriesReply) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
-	defer DPrintf("Node[%v] AE handler: request: %v reply: %v", rf.me, request, reply)
+	defer DPrintf("Node[%v] AE handler: request: %v reply: %v, my logs: %v", rf.me, request, reply, rf.logs)
 	if request.Term < rf.currentTerm {
 		reply.Success = false
 		reply.Term = rf.currentTerm
+		DPrintf("Node[%v] reject AE because the request is out of date", rf.me)
 		return
 	}
 	if request.LeaderCommit > rf.commitIndex {
@@ -282,19 +283,38 @@ func (rf *Raft) AppendEntries(request *AppendEntriesArgs, reply *AppendEntriesRe
 	if len(rf.logs)-1 < request.PrevLogIndex {
 		reply.Success = false
 		reply.Term = rf.currentTerm
+		DPrintf("Node[%v] reject AE because my log is too short", rf.me)
 		return
 	}
 	if rf.logs[request.PrevLogIndex].Term != request.PrevLogTerm {
 		reply.Success = false
 		reply.Term = rf.currentTerm
+		DPrintf("Node[%v] reject AE because logs mismatch", rf.me)
 		return
 	}
 	rf.changeState(Follower)
 	reply.Success = true
 	reply.Term = rf.currentTerm
-	rf.logs = append(rf.logs, request.Entries...)
+	if isConflict, id := rf.findConfilctLogs(request); isConflict {
+		rf.logs = append(rf.logs[:id+request.PrevLogIndex], request.Entries[id:]...)
+	} else {
+		rf.logs = append(rf.logs[:request.PrevLogIndex+1], request.Entries...)
+	}
 	rf.nextElectionTime = time.Now().Add(randomizedTimeDuration())
 
+}
+
+func (rf *Raft) findConfilctLogs(request *AppendEntriesArgs) (bool, int) {
+	conflictIndex := 0
+	isConflict := false
+	for i, e := range rf.logs[request.PrevLogIndex : request.PrevLogIndex+len(request.Entries)] {
+		if e.Term != request.Entries[i].Term {
+			conflictIndex = i
+			isConflict = true
+			break
+		}
+	}
+	return isConflict, conflictIndex
 }
 
 //
@@ -356,67 +376,86 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	isLeader := true
 
 	// Your code here (2B).
+
 	rf.mu.Lock()
-	index = len(rf.logs) - 1
-	term = rf.currentTerm
 	if rf.state != Leader {
 		isLeader = false
 		rf.mu.Unlock()
 		return index, term, isLeader
 	}
-	request := &AppendEntriesArgs{
-		Term:         rf.currentTerm,
-		LeaderId:     rf.me,
-		PrevLogIndex: len(rf.logs) - 1,
-		PrevLogTerm:  rf.logs[len(rf.logs)-1].Term,
-		Entries: append([]Entry{}, Entry{
-			Command: command,
-			Term:    rf.currentTerm,
-		}),
-		LeaderCommit: rf.commitIndex,
-	}
 	rf.logs = append(rf.logs, Entry{
 		Command: command,
 		Term:    rf.currentTerm,
 	})
+
 	rf.mu.Unlock()
+	DPrintf("Node[%v] starting agreement on command: %v", rf.me, command)
 
 	appendCh := make(chan int, 1)
 	appendCh <- 1
-	appendGranted := 0
-
+	appendGranted := 1
+	reply := &AppendEntriesReply{
+		Term:    term,
+		Success: false,
+	}
 	for server := range rf.peers {
-		reply := new(AppendEntriesReply)
-
+		if server == rf.me {
+			continue
+		}
 		go func(server int) {
 			<-appendCh
-			if rf.sendAppendEntries(server, request, reply) {
-				rf.mu.Lock()
-				defer rf.mu.Unlock()
-				if rf.currentTerm != reply.Term || rf.state != Leader {
-					return
-				}
-				appendCh <- 1
-				if reply.Success {
-					appendGranted += 1
-					rf.nextIndex[server] = index + 1
-					if appendGranted > len(rf.peers)/2 {
-						rf.commitIndex = index
-						rf.applyCh <- ApplyMsg{
-							CommandValid: true,
-							Command:      command,
-							CommandIndex: index,
 
-							SnapshotValid: false,
-							Snapshot:      []byte{},
-							SnapshotTerm:  -1,
-							SnapshotIndex: -1,
-						}
-					}
-				} else {
-					rf.nextIndex[server] -= 1
+			for {
+				rf.mu.Lock()
+				request := &AppendEntriesArgs{
+					Term:         rf.currentTerm,
+					LeaderId:     rf.me,
+					PrevLogIndex: len(rf.logs) - 2,
+					PrevLogTerm:  rf.logs[len(rf.logs)-2].Term,
+					Entries:      rf.logs[rf.nextIndex[server]+1:],
+					LeaderCommit: rf.commitIndex,
 				}
+				rf.mu.Unlock()
+				if rf.sendAppendEntries(server, request, reply) {
+					rf.mu.Lock()
+					if rf.currentTerm != reply.Term || rf.state != Leader {
+						rf.mu.Unlock()
+						return
+					}
+					if !reply.Success {
+						if rf.nextIndex[server] > 0 {
+							rf.nextIndex[server] -= 1
+						}
+						rf.mu.Unlock()
+					} else {
+						appendGranted += 1
+						appendCh <- 1
+						rf.nextIndex[server] = len(rf.logs)
+						if appendGranted > len(rf.peers)/2 {
+							rf.logs = append(rf.logs, Entry{
+								Command: command,
+								Term:    rf.currentTerm,
+							})
+							rf.commitIndex = index
+							rf.applyCh <- ApplyMsg{
+								CommandValid: true,
+								Command:      command,
+								CommandIndex: index,
+
+								SnapshotValid: false,
+								Snapshot:      []byte{},
+								SnapshotTerm:  -1,
+								SnapshotIndex: -1,
+							}
+						}
+						rf.mu.Unlock()
+						break
+
+					}
+				}
+
 			}
+
 		}(server)
 	}
 
